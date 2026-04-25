@@ -1,0 +1,100 @@
+seed: 42
+
+model:
+  pretrained_model_dir: pretrained_models/Spark-TTS-0.5B
+  use_codebook: true
+
+  config_path: null
+  init_ckpt_path: null
+  feature_extractor_path: null
+  strict_load: false
+
+data:
+  train_manifest: /home/jyp/LASE/Spark-TTS/manifests/voxceleb2.json
+  valid_manifest: null
+  audio_key: audio_filepath
+  base_dir: null
+  volume_normalize: false
+  segment_duration: 3.2
+  ref_segment_duration: 3.0
+  min_duration: 0.5
+  max_duration: 30.0
+
+feature_extractor:
+  # Paper Sec. 3.2: use wav2vec2 XLSR-53 hidden states from layers 11, 14, 16 and average them
+  hidden_state_indices: [11, 14, 16]
+
+loss:
+  vq_distance_loss_type: l1
+
+  # Reconstruction / adversarial objectives described in Sec. 3.3
+  waveform_l1_weight: 1.0
+
+  # Must be ON to match the paper, because wav2vec 2.0 reconstruction loss is explicitly used.
+  # Exact scalar is not specified in the paper, so set this non-zero.
+  feature_l1_weight: 1.0
+
+  mel_weight: 45.0
+  stft_weight: 1.0
+  vq_weight: 1.0
+
+  generator_mp_weight: 1.0
+  generator_mrd_weight: 1.0
+  feature_matching_mp_weight: 1.0
+  feature_matching_mrd_weight: 1.0
+  discriminator_mp_weight: 1.0
+  discriminator_mrd_weight: 1.0
+
+  mel_n_fft: 1024
+  mel_hop_length: 256
+  mel_n_mels: 80
+  mel_f_min: 0
+  mel_f_max: 8000
+
+  stft_resolutions:
+    - [1024, 256, 1024]
+    - [2048, 512, 2048]
+    - [512, 128, 512]
+
+discriminator:
+  periods: [2, 3, 5, 7, 11]
+  fft_sizes: [2048, 1024, 512]
+
+optim:
+  # Paper Sec. 6.1: AdamW, beta1=0.8, beta2=0.9
+  lr: 0.0001
+  min_lr: 0.00001
+  betas: [0.8, 0.9]
+  weight_decay: 0.0
+
+disc_optim:
+  # Match BiCodec optimization setting
+  lr: 0.0001
+  min_lr: 0.00001
+  betas: [0.8, 0.9]
+  weight_decay: 0.0
+
+trainer:
+  output_dir: exp/bicodec_paper
+  device: null
+
+  # Paper gives effective batch in audio seconds, not item count:
+  # 614.4 sec / step.
+  # With segment_duration=3.2 and batch_size=4, one forward step = 12.8 sec.
+  # 614.4 / 12.8 = 48, so grad_accum_steps=48 matches the paper's effective batch.
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 4
+
+  max_epochs: 10000000
+  max_steps: 800000
+  pretrain_mel_steps: 0
+
+  grad_accum_steps: 48
+  clip_grad_norm: 1.0
+  use_amp: true
+
+  log_every_steps: 10
+  save_every_steps: 100000
+  eval_every_steps: 10000
+  resume_from: null
