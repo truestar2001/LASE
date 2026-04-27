@@ -1,0 +1,26 @@
+# exp3: same wav -> ECAPA latent resize to semantic T -> adapter -> original pool/project path
+
+base_config: base/train_bicodec.yaml
+
+model:
+  speaker_input_key: wav
+  speaker_time_adapter:
+    enabled: true
+    detach_input: true
+    hidden_dim: 512
+    num_layers: 3
+    kernel_size: 3
+    dropout: 0.0
+
+trainer:
+  output_dir: outputs/bicodec_exp3
+  detach_xvector_condition: true
+  freeze:
+    encoder: true
+    quantizer: true
+    speaker_encoder: true
+    speaker_time_adapter: false
+    mel_transformer: true
+    prenet: false
+    postnet: false
+    decoder: false

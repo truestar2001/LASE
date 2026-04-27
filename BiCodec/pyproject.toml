@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bicodec"
+version = "0.1.0"
+description = "Standalone BiCodec training and inference package extracted from Spark-TTS."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+  "einops>=0.7.0",
+  "einx>=0.3.0",
+  "numpy>=1.24",
+  "omegaconf>=2.3.0",
+  "packaging>=24.0",
+  "safetensors>=0.4.0",
+  "soundfile>=0.12.1",
+  "soxr>=0.3.7",
+  "torch>=2.1.0",
+  "torchaudio>=2.1.0",
+  "tqdm>=4.66.0",
+  "transformers>=4.40.0",
+]
+
+[project.scripts]
+bicodec-train = "bicodec.cli.train:main"
+bicodec-split-manifest = "bicodec.cli.split_manifest:main"
+bicodec-tokenize = "bicodec.cli.tokenize:main"
+bicodec-reconstruct = "bicodec.cli.reconstruct:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

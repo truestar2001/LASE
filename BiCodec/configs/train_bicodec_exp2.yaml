@@ -1,0 +1,24 @@
+# exp2: exp1 + shared speaker adapter for decoder conditioning and speaker classification
+
+base_config: base/train_bicodec.yaml
+
+model:
+  speaker_adapter:
+    enabled: true
+    hidden_dim: 512
+    dropout: 0.0
+
+trainer:
+  speaker_classification: true
+  output_dir: outputs/bicodec_exp2
+  detach_xvector_condition: true
+  freeze:
+    encoder: true
+    quantizer: true
+    speaker_encoder: true
+    speaker_adapter: false
+    mel_transformer: true
+    prenet: false
+    postnet: false
+    decoder: false
+    speaker_classifier: false

@@ -1,0 +1,83 @@
+seed: 42
+
+model:
+  pretrained_model_dir: artifacts/pretrained/bicodec-base
+  use_codebook: true
+  config_path: null
+  init_ckpt_path: null
+  feature_extractor_path: null
+  strict_load: false
+
+data:
+  train_manifest: data/manifests/voxceleb2_train.jsonl
+  valid_manifest: data/manifests/voxceleb2_valid.jsonl
+  speaker_id_key: speaker_id
+  audio_key: audio_filepath
+  base_dir: null
+  volume_normalize: false
+  segment_duration: 3.2
+  ref_segment_duration: 3.0
+  min_duration: 0.5
+  max_duration: 30.0
+
+feature_extractor:
+  hidden_state_indices: [11, 14, 16]
+
+loss:
+  vq_distance_loss_type: l1
+  waveform_l1_weight: 1.0
+  feature_l1_weight: 0.0
+  mel_weight: 45.0
+  stft_weight: 1.0
+  vq_weight: 1.0
+  generator_mp_weight: 1.0
+  generator_mrd_weight: 1.0
+  feature_matching_mp_weight: 1.0
+  feature_matching_mrd_weight: 1.0
+  discriminator_mp_weight: 1.0
+  discriminator_mrd_weight: 1.0
+  speaker_classification_weight: 1.0
+  mel_n_fft: 1024
+  mel_hop_length: 256
+  mel_n_mels: 80
+  mel_f_min: 0
+  mel_f_max: 8000
+  stft_resolutions:
+    - [1024, 256, 1024]
+    - [2048, 512, 2048]
+    - [512, 128, 512]
+
+discriminator:
+  periods: [2, 3, 5, 7, 11]
+  fft_sizes: [2048, 1024, 512]
+
+optim:
+  lr: 0.0001
+  min_lr: 0.00001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+
+disc_optim:
+  lr: 0.0001
+  min_lr: 0.00001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+
+trainer:
+  speaker_classification: false
+  freeze_semantic_encoder: false
+  output_dir: outputs/bicodec
+  device: null
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 4
+  max_epochs: 100
+  max_steps: 800000
+  pretrain_mel_steps: 0
+  grad_accum_steps: 1
+  clip_grad_norm: 1.0
+  use_amp: true
+  log_every_steps: 10
+  save_every_steps: 10000
+  eval_every_steps: 10000
+  resume_from: null

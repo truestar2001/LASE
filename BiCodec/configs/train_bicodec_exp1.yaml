@@ -1,0 +1,15 @@
+# exp1: semantic/VQ/speaker encoder 고정, decoder stack만 학습
+
+base_config: base/train_bicodec.yaml
+
+trainer:
+  output_dir: outputs/bicodec_exp1
+  detach_xvector_condition: true
+  freeze:
+    encoder: true
+    quantizer: true
+    speaker_encoder: true
+    mel_transformer: true
+    prenet: false
+    postnet: false
+    decoder: false

@@ -1,0 +1,1 @@
+"""Finite scalar quantization modules."""
