@@ -84,13 +84,16 @@ def compute_reconstruction_losses(
     mel_loss = mel_loss_fn(pred_wav.squeeze(1), target_wav.squeeze(1))
     stft_loss = stft_loss_fn(pred_wav.squeeze(1), target_wav.squeeze(1))
     vq_loss = outputs["vq_loss"]
+    vq_weight = float(cfg.loss.vq_weight)
+    skip_vq_loss = vq_weight == 0.0
+    vq_term = pred_wav.new_tensor(0.0) if skip_vq_loss else vq_weight * vq_loss
 
     total = (
         float(cfg.loss.waveform_l1_weight) * waveform_l1
         + float(cfg.loss.feature_l1_weight) * feature_l1
         + float(cfg.loss.mel_weight) * mel_loss
         + float(cfg.loss.stft_weight) * stft_loss
-        + float(cfg.loss.vq_weight) * vq_loss
+        + vq_term
     )
     return {
         "total": total,
@@ -98,7 +101,7 @@ def compute_reconstruction_losses(
         "feature_l1": feature_l1.detach(),
         "mel": mel_loss.detach(),
         "stft": stft_loss.detach(),
-        "vq": vq_loss.detach(),
+        "vq": pred_wav.new_tensor(0.0).detach() if skip_vq_loss else vq_loss.detach(),
         "perplexity": outputs["perplexity"].detach(),
         "active_num": outputs["cluster_size"].detach(),
     }

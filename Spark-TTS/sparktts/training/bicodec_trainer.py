@@ -1,18 +1,22 @@
 import json
 import math
+import os
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import load_file as load_safetensors
 from torch import nn
 from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from transformers import Wav2Vec2FeatureExtractor, Wav2Vec2Model
 
 from sparktts.models.bicodec import BiCodec
@@ -28,25 +32,11 @@ from sparktts.utils.audio import load_audio, stft
 from sparktts.utils.file import load_config, read_jsonl
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-import json
-from pathlib import Path
-from typing import Any, Dict, List
-
-
 def _read_json_file(path: Path) -> List[Dict[str, Any]]:
     with path.open("r", encoding="utf-8") as f:
         text = f.read().strip()
-
     if not text:
         return []
-
-    # 1) 일반 JSON array / dict 시도
     try:
         data = json.loads(text)
         if isinstance(data, list):
@@ -55,8 +45,6 @@ def _read_json_file(path: Path) -> List[Dict[str, Any]]:
             return list(data.values())
     except json.JSONDecodeError:
         pass
-
-    # 2) JSONL fallback
     entries: List[Dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
         for lineno, line in enumerate(f, start=1):
@@ -66,15 +54,12 @@ def _read_json_file(path: Path) -> List[Dict[str, Any]]:
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError as e:
-                raise ValueError(
-                    f"Invalid JSONL manifest at {path}, line {lineno}: {e}"
-                ) from e
+                raise ValueError(f"Invalid JSONL manifest at {path}, line {lineno}: {e}") from e
             if not isinstance(obj, dict):
                 raise ValueError(
                     f"Expected JSON object per line in {path}, line {lineno}, got {type(obj)}"
                 )
             entries.append(obj)
-
     return entries
 
 
@@ -84,6 +69,146 @@ def load_manifest(path: Path) -> List[Dict[str, Any]]:
     if path.suffix == ".json":
         return _read_json_file(path)
     raise ValueError(f"Unsupported manifest extension: {path}")
+
+
+def build_speaker_label_map(
+    manifest_paths: Union[str, Sequence[str]], speaker_id_key: str = "speaker_id"
+) -> Tuple[Dict[str, int], int]:
+    paths = [manifest_paths] if isinstance(manifest_paths, str) else list(manifest_paths)
+    paths = [p for p in paths if p]
+    sids: set = set()
+    for p in paths:
+        for e in load_manifest(Path(p)):
+            v = e.get(speaker_id_key)
+            if v is not None:
+                sids.add(str(v))
+    ordered = sorted(sids)
+    if not ordered:
+        raise ValueError(f"No {speaker_id_key!r} in manifests {paths} (need labels for speaker classification).")
+    return {s: i for i, s in enumerate(ordered)}, len(ordered)
+
+
+def speaker_xvector_dim(model_config: Any) -> int:
+    mc = OmegaConf.to_container(model_config, resolve=True)
+    if not isinstance(mc, dict):
+        return 512
+    if "audio_tokenizer" in mc and isinstance(mc["audio_tokenizer"], dict):
+        mc = mc["audio_tokenizer"]
+    se = mc.get("speaker_encoder", {})
+    if isinstance(se, dict) and "out_dim" in se:
+        return int(se["out_dim"])
+    return 512
+
+
+# BiCodec 서브모듈 이름 (trainer.freeze 키와 동일)
+BICODEC_FREEZABLE: Tuple[str, ...] = (
+    "encoder",
+    "quantizer",
+    "speaker_encoder",
+    "speaker_time_condition",
+    "prenet",
+    "postnet",
+    "decoder",
+    "mel_transformer",
+    "speaker_classifier",
+)
+FREEZE_NAME_ALIASES: Dict[str, str] = {
+    "speaker_time_adapter": "speaker_time_condition",
+}
+
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+
+def effective_trainer_freeze(cfg: DictConfig) -> Optional[Dict[str, bool]]:
+    """
+    `trainer.freeze` 딕셔너리가 있으면 그대로 사용(키는 BICODEC_FREEZABLE만 유효).
+    없고 `freeze_semantic_encoder: true`면 encoder+quantizer만 True로 간주(레거시).
+    """
+    raw = cfg.trainer.get("freeze")
+    if raw is not None:
+        d = OmegaConf.to_container(raw, resolve=True)
+        if not isinstance(d, dict):
+            return None
+        out: Dict[str, bool] = {}
+        for k, v in d.items():
+            k = FREEZE_NAME_ALIASES.get(str(k), str(k))
+            if k not in BICODEC_FREEZABLE or not isinstance(v, (bool, int)):
+                continue
+            out[str(k)] = bool(v)
+        if out:
+            return out
+    if bool(cfg.trainer.get("freeze_semantic_encoder", False)):
+        return {"encoder": True, "quantizer": True}
+    return None
+
+
+def apply_trainer_freeze_from_config(model: nn.Module, cfg: DictConfig) -> None:
+    m = unwrap_model(model)
+    spec = effective_trainer_freeze(cfg)
+    if not spec:
+        return
+    for name, frozen in spec.items():
+        if name not in BICODEC_FREEZABLE:
+            continue
+        sub = getattr(m, name, None)
+        if sub is None:
+            continue
+        sub.requires_grad_(not frozen)
+
+
+def set_bicodec_experiment_model_train_mode(model: nn.Module, cfg: DictConfig) -> None:
+    """m.train() 후: `trainer.freeze`에 따라 True면 eval, False면 train."""
+    m = unwrap_model(model)
+    m.train()
+    spec = effective_trainer_freeze(cfg)
+    if not spec:
+        return
+    for name, frozen in spec.items():
+        if name not in BICODEC_FREEZABLE:
+            continue
+        sub = getattr(m, name, None)
+        if sub is None:
+            continue
+        if frozen:
+            sub.eval()
+        else:
+            sub.train()
+
+
+def bicodec_train_init(
+    cfg: DictConfig,
+    model: nn.Module,
+    model_config: Any,
+    device: torch.device,
+    *,
+    do_print: bool = True,
+) -> Optional[Dict[str, int]]:
+    """
+    DDP 래핑 전에 호출. speaker_classification 켜면 manifest에서 라벨 맵·Linear 헤드 추가.
+    """
+    m = unwrap_model(model)
+    sid_map: Optional[Dict[str, int]] = None
+    if bool(cfg.trainer.get("speaker_classification", False)):
+        paths = [cfg.data.train_manifest]
+        if cfg.data.get("valid_manifest"):
+            paths.append(cfg.data.valid_manifest)
+        sk = str(cfg.data.get("speaker_id_key", "speaker_id"))
+        sid_map, n_cls = build_speaker_label_map(paths, sk)
+        dim = speaker_xvector_dim(model_config)
+        m.add_module("speaker_classifier", nn.Linear(dim, n_cls).to(device))
+        if do_print:
+            print(f"[train] speaker_classification  classes={n_cls}  x_vector_dim={dim}")
+    apply_trainer_freeze_from_config(model, cfg)
+    m._bicodec_detach_xvector = bool(cfg.trainer.get("detach_xvector_condition", False))
+    if do_print and getattr(m, "speaker_time_condition", None) is not None:
+        print(
+            "[train] speaker_time_condition  "
+            f"speaker_input_key={getattr(m, 'speaker_input_key', 'ref_wav')}  "
+            f"detach_input={bool(getattr(m, 'detach_speaker_time_input', False))}"
+        )
+    return sid_map
 
 
 def pad_1d_batch(items: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -110,6 +235,35 @@ def build_reference_clip(wav: torch.Tensor, sample_rate: int, duration: float) -
     return wav.repeat(repeat)[:ref_length]
 
 
+def apply_bicodec_model_overrides(
+    model_config: Any,
+    *,
+    speaker_input_key: Optional[str] = None,
+    speaker_time_condition: Optional[Any] = None,
+) -> DictConfig:
+    config_dict = OmegaConf.to_container(model_config, resolve=True)
+    if not isinstance(config_dict, dict):
+        raise TypeError(f"Expected dict-like model config, got {type(config_dict)}")
+
+    target = config_dict
+    audio_tokenizer_cfg = config_dict.get("audio_tokenizer")
+    if isinstance(audio_tokenizer_cfg, dict):
+        target = audio_tokenizer_cfg
+
+    if speaker_input_key is not None:
+        target["speaker_input_key"] = str(speaker_input_key)
+
+    if speaker_time_condition is not None:
+        if isinstance(speaker_time_condition, DictConfig):
+            speaker_time_condition = OmegaConf.to_container(
+                speaker_time_condition, resolve=True
+            )
+        if isinstance(speaker_time_condition, dict):
+            target["speaker_time_adapter"] = speaker_time_condition
+
+    return OmegaConf.create(config_dict)
+
+
 class AudioManifestDataset(Dataset):
     def __init__(
         self,
@@ -122,11 +276,15 @@ class AudioManifestDataset(Dataset):
         min_duration: Optional[float] = None,
         max_duration: Optional[float] = None,
         ref_segment_duration: float = 3.0,
+        speaker_id_key: str = "speaker_id",
+        speaker_id_to_idx: Optional[Dict[str, int]] = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.entries = load_manifest(self.manifest_path)
         self.sample_rate = sample_rate
         self.audio_key = audio_key
+        self.speaker_id_key = speaker_id_key
+        self.speaker_id_to_idx = speaker_id_to_idx
         self.base_dir = Path(base_dir) if base_dir else None
         self.volume_normalize = volume_normalize
         self.segment_duration = segment_duration
@@ -140,7 +298,6 @@ class AudioManifestDataset(Dataset):
     ) -> List[Dict[str, Any]]:
         if min_duration is None and max_duration is None:
             return self.entries
-
         filtered = []
         for entry in self.entries:
             duration = entry.get("duration")
@@ -178,21 +335,103 @@ class AudioManifestDataset(Dataset):
             sample_rate=self.sample_rate,
             duration=self.ref_segment_duration,
         )
-        return {
+        out: Dict[str, Any] = {
             "wav": wav_tensor,
             "ref_wav": ref_wav,
             "audio_filepath": str(wav_path),
         }
+        if self.speaker_id_to_idx is not None:
+            sid = entry.get(self.speaker_id_key)
+            if sid is None:
+                raise KeyError(
+                    f"Missing {self.speaker_id_key!r} for {wav_path} (required when using speaker_id_to_idx)"
+                )
+            out["speaker_label"] = self.speaker_id_to_idx[str(sid)]
+        return out
 
 
 def collate_audio_batch(batch: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     wavs = pad_1d_batch([item["wav"] for item in batch])
     ref_wavs = pad_1d_batch([item["ref_wav"] for item in batch])
-    return {
+    out: Dict[str, Any] = {
         "wav": wavs,
         "ref_wav": ref_wavs,
         "audio_filepath": [item["audio_filepath"] for item in batch],
     }
+    if batch and all("speaker_label" in item for item in batch):
+        out["speaker_label"] = torch.tensor(
+            [int(item["speaker_label"]) for item in batch], dtype=torch.long
+        )
+    return out
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def is_dist_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist_initialized() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_dist_initialized() else 1
+
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+
+def setup_device_and_ddp(cfg: DictConfig) -> Tuple[torch.device, int, bool]:
+    use_ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+    if use_ddp:
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP requires CUDA, but CUDA is not available.")
+
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+    else:
+        device_name = cfg.trainer.get("device")
+        if device_name:
+            device = torch.device(device_name)
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        local_rank = 0
+
+    return device, local_rank, use_ddp
+
+
+def cleanup_ddp() -> None:
+    if is_dist_initialized():
+        dist.destroy_process_group()
+
+
+def ddp_average_scalar(value: float, device: torch.device) -> float:
+    if not is_dist_initialized():
+        return value
+    tensor = torch.tensor(value, device=device, dtype=torch.float32)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= get_world_size()
+    return float(tensor.item())
+
+
+def ddp_average_metrics(metrics: Dict[str, float], device: torch.device) -> Dict[str, float]:
+    if not is_dist_initialized():
+        return metrics
+    reduced = {}
+    for key, value in metrics.items():
+        reduced[key] = ddp_average_scalar(float(value), device)
+    return reduced
 
 
 class FrozenWav2Vec2Frontend(nn.Module):
@@ -217,7 +456,10 @@ class FrozenWav2Vec2Frontend(nn.Module):
             return_tensors="pt",
             padding=True,
         )
-        outputs = self.model(inputs.input_values.to(self.model.device), output_hidden_states=True)
+        outputs = self.model(
+            inputs.input_values.to(self.model.device),
+            output_hidden_states=True,
+        )
         hidden_states = [outputs.hidden_states[idx] for idx in self.hidden_state_indices]
         return sum(hidden_states) / len(hidden_states)
 
@@ -257,8 +499,14 @@ def build_bicodec_model(
     strict_load: bool,
     quantizer_distance_loss_type: Optional[str] = None,
     use_codebook: Optional[bool] = None,
+    speaker_input_key: Optional[str] = None,
+    speaker_time_condition: Optional[Any] = None,
 ) -> Tuple[BiCodec, DictConfig]:
-    model_config = load_config(config_path)
+    model_config = apply_bicodec_model_overrides(
+        load_config(config_path),
+        speaker_input_key=speaker_input_key,
+        speaker_time_condition=speaker_time_condition,
+    )
     model = BiCodec.from_config(model_config)
     if use_codebook is not None:
         model.use_codebook = bool(use_codebook)
@@ -267,9 +515,9 @@ def build_bicodec_model(
     if init_ckpt_path:
         state_dict = load_state_dict_for_training(init_ckpt_path)
         missing, unexpected = model.load_state_dict(state_dict, strict=strict_load)
-        if missing:
+        if missing and is_main_process():
             print(f"[init] missing keys: {missing}")
-        if unexpected:
+        if unexpected and is_main_process():
             print(f"[init] unexpected keys: {unexpected}")
     return model, model_config
 
@@ -319,9 +567,12 @@ def save_checkpoint(
     cfg: DictConfig,
     discriminator_state: Optional[Dict[str, Any]] = None,
 ) -> None:
+    if not is_main_process():
+        return
+
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "state_dict": model.state_dict(),
+        "state_dict": unwrap_model(model).state_dict(),
         "optimizer": optimizer_g.state_dict(),
         "scheduler": None if scheduler_g is None else scheduler_g.state_dict(),
         "scaler": scaler_g.state_dict(),
@@ -351,8 +602,9 @@ def maybe_load_resume(
         return 0, 0, None
 
     pkg = torch.load(resume_path, map_location="cpu", weights_only=False)
-    model.load_state_dict(pkg["state_dict"])
+    unwrap_model(model).load_state_dict(pkg["state_dict"])
     optimizer_g.load_state_dict(pkg["optimizer"])
+
     if scheduler_g is not None and pkg.get("scheduler") is not None:
         scheduler_g.load_state_dict(pkg["scheduler"])
     if pkg.get("scaler") is not None:
@@ -361,15 +613,16 @@ def maybe_load_resume(
     disc_state = pkg.get("discriminator")
     if disc_state is not None:
         if mpd is not None and disc_state.get("mpd") is not None:
-            mpd.load_state_dict(disc_state["mpd"])
+            unwrap_model(mpd).load_state_dict(disc_state["mpd"])
         if mrd is not None and disc_state.get("mrd") is not None:
-            mrd.load_state_dict(disc_state["mrd"])
+            unwrap_model(mrd).load_state_dict(disc_state["mrd"])
         if optimizer_d is not None and disc_state.get("optimizer_d") is not None:
             optimizer_d.load_state_dict(disc_state["optimizer_d"])
         if scheduler_d is not None and disc_state.get("scheduler_d") is not None:
             scheduler_d.load_state_dict(disc_state["scheduler_d"])
         if scaler_d is not None and disc_state.get("scaler_d") is not None:
             scaler_d.load_state_dict(disc_state["scaler_d"])
+
     return int(pkg.get("epoch", 0)), int(pkg.get("global_step", 0)), pkg.get("best_val_loss")
 
 
@@ -448,45 +701,54 @@ def evaluate(
 
     with torch.no_grad():
         for batch in dataloader:
-            wav = batch["wav"].to(device)
-            ref_wav = batch["ref_wav"].to(device)
+            wav = batch["wav"].to(device, non_blocking=True)
+            ref_wav = batch["ref_wav"].to(device, non_blocking=True)
             feat = frontend(wav)
-            outputs = model({"wav": wav, "ref_wav": ref_wav, "feat": feat})
-            losses = compute_reconstruction_losses(outputs, feat, mel_loss_fn, stft_loss_fn, cfg)
+
+            with autocast(device_type=device.type, enabled=(device.type == "cuda")):
+                outputs = model({"wav": wav, "ref_wav": ref_wav, "feat": feat})
+                losses = compute_reconstruction_losses(outputs, feat, mel_loss_fn, stft_loss_fn, cfg)
+
             for key, value in losses.items():
                 totals[key] = totals.get(key, 0.0) + float(value)
             count += 1
 
-    model.train()
-    return {key: value / max(count, 1) for key, value in totals.items()}
+    set_bicodec_experiment_model_train_mode(model, cfg)
+
+    local_metrics = {key: value / max(count, 1) for key, value in totals.items()}
+    return ddp_average_metrics(local_metrics, device)
 
 
 def train_bicodec(cfg: DictConfig) -> None:
     set_seed(int(cfg.get("seed", 42)))
+
+    device, local_rank, use_ddp = setup_device_and_ddp(cfg)
     paths = resolve_training_paths(cfg)
+
     output_dir = Path(cfg.trainer.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(cfg, output_dir / "train_config.yaml")
+    if is_main_process():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        OmegaConf.save(cfg, output_dir / "train_config.yaml")
 
-    device_name = cfg.trainer.get("device")
-    if device_name:
-        device = torch.device(device_name)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if is_dist_initialized():
+        dist.barrier()
 
-    print("torch.cuda.is_available():", torch.cuda.is_available())
-    print("torch.cuda.device_count():", torch.cuda.device_count())
-    print("current_device:", torch.cuda.current_device() if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        print("device_name:", torch.cuda.get_device_name(torch.cuda.current_device()))
     model, model_config = build_bicodec_model(
         config_path=paths["model_config_path"],
         init_ckpt_path=paths["init_ckpt_path"],
         strict_load=bool(cfg.model.get("strict_load", False)),
         quantizer_distance_loss_type=cfg.loss.get("vq_distance_loss_type"),
         use_codebook=cfg.model.get("use_codebook"),
+        speaker_input_key=cfg.model.get("speaker_input_key"),
+        speaker_time_condition=cfg.model.get(
+            "speaker_time_adapter", cfg.model.get("speaker_time_condition")
+        ),
     )
     model = model.to(device)
+    use_speaker_cls = bool(cfg.trainer.get("speaker_classification", False))
+    speaker_id_to_idx = bicodec_train_init(
+        cfg, model, model_config, device, do_print=is_main_process()
+    )
 
     frontend = FrozenWav2Vec2Frontend(
         model_name_or_path=paths["feature_extractor_path"],
@@ -494,7 +756,9 @@ def train_bicodec(cfg: DictConfig) -> None:
         device=device,
     )
 
-    sample_rate = int(model_config.get("sample_rate", model_config.get("audio_tokenizer", {}).get("sample_rate", 16000)))
+    sample_rate = int(
+        model_config.get("sample_rate", model_config.get("audio_tokenizer", {}).get("sample_rate", 16000))
+    )
     if sample_rate != 16000:
         raise ValueError(f"Training frontend currently expects 16000 Hz audio, got {sample_rate}")
 
@@ -508,7 +772,10 @@ def train_bicodec(cfg: DictConfig) -> None:
         min_duration=cfg.data.get("min_duration"),
         max_duration=cfg.data.get("max_duration"),
         ref_segment_duration=float(model_config.get("ref_segment_duration", cfg.data.get("ref_segment_duration", 3.0))),
+        speaker_id_key=str(cfg.data.get("speaker_id_key", "speaker_id")),
+        speaker_id_to_idx=speaker_id_to_idx,
     )
+
     valid_manifest = cfg.data.get("valid_manifest")
     valid_dataset = None
     if valid_manifest:
@@ -521,33 +788,46 @@ def train_bicodec(cfg: DictConfig) -> None:
             segment_duration=cfg.data.get("segment_duration"),
             min_duration=cfg.data.get("min_duration"),
             max_duration=cfg.data.get("max_duration"),
-            ref_segment_duration=float(model_config.get("ref_segment_duration", cfg.data.get("ref_segment_duration", 3.0))),
+            ref_segment_duration=float(
+                model_config.get("ref_segment_duration", cfg.data.get("ref_segment_duration", 3.0))
+            ),
+            speaker_id_key=str(cfg.data.get("speaker_id_key", "speaker_id")),
+            speaker_id_to_idx=speaker_id_to_idx,
         )
+
+    train_sampler = DistributedSampler(train_dataset, shuffle=True) if use_ddp else None
+    valid_sampler = DistributedSampler(valid_dataset, shuffle=False) if (use_ddp and valid_dataset is not None) else None
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(cfg.trainer.batch_size),
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=int(cfg.trainer.num_workers),
         pin_memory=device.type == "cuda",
         collate_fn=collate_audio_batch,
         drop_last=False,
+        persistent_workers=int(cfg.trainer.num_workers) > 0,
     )
+
     valid_loader = None
     if valid_dataset is not None:
         valid_loader = DataLoader(
             valid_dataset,
             batch_size=int(cfg.trainer.eval_batch_size),
             shuffle=False,
+            sampler=valid_sampler,
             num_workers=int(cfg.trainer.num_workers),
             pin_memory=device.type == "cuda",
             collate_fn=collate_audio_batch,
             drop_last=False,
+            persistent_workers=int(cfg.trainer.num_workers) > 0,
         )
 
     sample_rate_for_losses = int(
         model_config.get("sample_rate", model_config.get("audio_tokenizer", {}).get("sample_rate", 16000))
     )
+
     mel_loss_fn = MelSpecReconstructionLoss(
         sample_rate=sample_rate_for_losses,
         n_fft=int(cfg.loss.mel_n_fft),
@@ -556,15 +836,27 @@ def train_bicodec(cfg: DictConfig) -> None:
         f_min=int(cfg.loss.get("mel_f_min", 0)),
         f_max=int(cfg.loss.get("mel_f_max", sample_rate_for_losses // 2)),
     ).to(device)
+
     stft_loss_fn = MultiResolutionSTFTLoss(cfg.loss.stft_resolutions)
 
-    mpd = MultiPeriodDiscriminator(periods=tuple(cfg.discriminator.get("periods", [2, 3, 5, 7, 11]))).to(device)
-    mrd = MultiResolutionDiscriminator(fft_sizes=tuple(cfg.discriminator.get("fft_sizes", [2048, 1024, 512]))).to(device)
+    mpd = MultiPeriodDiscriminator(
+        periods=tuple(cfg.discriminator.get("periods", [2, 3, 5, 7, 11]))
+    ).to(device)
+    mrd = MultiResolutionDiscriminator(
+        fft_sizes=tuple(cfg.discriminator.get("fft_sizes", [2048, 1024, 512]))
+    ).to(device)
+
+    if use_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        mpd = DDP(mpd, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        mrd = DDP(mrd, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+
     gen_loss_fn = GeneratorLoss()
     disc_loss_fn = DiscriminatorLoss()
     feat_matching_loss_fn = FeatureMatchingLoss()
 
     optimizer = make_optimizer(cfg, model.parameters())
+
     disc_optim_cfg = cfg.get("disc_optim", cfg.optim)
     optimizer_d = AdamW(
         list(mpd.parameters()) + list(mrd.parameters()),
@@ -572,6 +864,7 @@ def train_bicodec(cfg: DictConfig) -> None:
         betas=tuple(disc_optim_cfg.get("betas", [0.9, 0.999])),
         weight_decay=float(disc_optim_cfg.get("weight_decay", 0.0)),
     )
+
     max_steps = int(cfg.trainer.max_steps)
     scheduler = CosineAnnealingLR(optimizer, T_max=max_steps, eta_min=float(cfg.optim.get("min_lr", 0.0)))
     scheduler_d = CosineAnnealingLR(
@@ -579,9 +872,10 @@ def train_bicodec(cfg: DictConfig) -> None:
         T_max=max_steps,
         eta_min=float(disc_optim_cfg.get("min_lr", 0.0)),
     )
+
     use_amp = bool(cfg.trainer.get("use_amp", True)) and device.type == "cuda"
-    scaler = GradScaler(enabled=use_amp)
-    scaler_d = GradScaler(enabled=use_amp)
+    scaler = GradScaler(device.type, enabled=use_amp)
+    scaler_d = GradScaler(device.type, enabled=use_amp)
 
     start_epoch, global_step, best_val_loss = maybe_load_resume(
         cfg.trainer.get("resume_from"),
@@ -603,147 +897,158 @@ def train_bicodec(cfg: DictConfig) -> None:
     max_epochs = int(cfg.trainer.get("max_epochs", 1))
     pretrain_mel_steps = int(cfg.trainer.get("pretrain_mel_steps", 0))
 
-    print(f"[train] device={device} train_items={len(train_dataset)} valid_items={0 if valid_dataset is None else len(valid_dataset)}")
-    print(f"[train] output_dir={output_dir}")
+    if is_main_process():
+        print(
+            f"[train] rank={get_rank()} world_size={get_world_size()} "
+            f"device={device} train_items={len(train_dataset)} "
+            f"valid_items={0 if valid_dataset is None else len(valid_dataset)}"
+        )
+        print(
+            f"[train] output_dir={output_dir}  "
+            f"speaker_classification={use_speaker_cls}  "
+            f"detach_xvector={bool(cfg.trainer.get('detach_xvector_condition', False))}"
+        )
 
-    model.train()
+    set_bicodec_experiment_model_train_mode(model, cfg)
     optimizer.zero_grad(set_to_none=True)
     optimizer_d.zero_grad(set_to_none=True)
 
-    for epoch in range(start_epoch, max_epochs):
-        for batch in train_loader:
-            wav = batch["wav"].to(device)
-            ref_wav = batch["ref_wav"].to(device)
-            feat = frontend(wav)
-            train_discriminator = global_step >= pretrain_mel_steps
+    try:
+        for epoch in range(start_epoch, max_epochs):
+            if use_ddp and train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
-            if train_discriminator:
-                with torch.no_grad():
-                    disc_outputs = model({"wav": wav, "ref_wav": ref_wav, "feat": feat})
-                    fake_wav = crop_to_match_last_dim(disc_outputs["recons"], disc_outputs["audios"])[0].squeeze(1)
-                    real_wav = crop_to_match_last_dim(disc_outputs["recons"], disc_outputs["audios"])[1].squeeze(1)
+            for batch in train_loader:
+                wav = batch["wav"].to(device, non_blocking=True)
+                ref_wav = batch["ref_wav"].to(device, non_blocking=True)
+                feat = frontend(wav)
+                train_discriminator = global_step >= pretrain_mel_steps
 
-                with autocast(device_type=device.type, enabled=use_amp):
-                    real_score_mp, fake_score_mp, _, _ = mpd(real_wav, fake_wav)
-                    real_score_mrd, fake_score_mrd, _, _ = mrd(real_wav, fake_wav)
-                    loss_disc_mp = average_discriminator_loss(disc_loss_fn, real_score_mp, fake_score_mp)
-                    loss_disc_mrd = average_discriminator_loss(disc_loss_fn, real_score_mrd, fake_score_mrd)
-                    disc_loss = (
-                        float(cfg.loss.discriminator_mp_weight) * loss_disc_mp
-                        + float(cfg.loss.discriminator_mrd_weight) * loss_disc_mrd
-                    )
-
-                scaler_d.scale(disc_loss).backward()
-                if (global_step + 1) % grad_accum_steps == 0:
-                    scaler_d.unscale_(optimizer_d)
-                    torch.nn.utils.clip_grad_norm_(
-                        list(mpd.parameters()) + list(mrd.parameters()),
-                        float(cfg.trainer.get("clip_grad_norm", 1.0)),
-                    )
-                    scaler_d.step(optimizer_d)
-                    scaler_d.update()
-                    optimizer_d.zero_grad(set_to_none=True)
-                    scheduler_d.step()
-
-            with autocast(device_type=device.type, enabled=use_amp):
-                outputs = model({"wav": wav, "ref_wav": ref_wav, "feat": feat})
-                recon_losses = compute_reconstruction_losses(outputs, feat, mel_loss_fn, stft_loss_fn, cfg)
-                pred_wav, target_wav = crop_to_match_last_dim(outputs["recons"], outputs["audios"])
-                fake_wav = pred_wav.squeeze(1)
-                real_wav = target_wav.squeeze(1)
-
-                loss_gen_mp = fake_wav.new_tensor(0.0)
-                loss_gen_mrd = fake_wav.new_tensor(0.0)
-                loss_fm_mp = fake_wav.new_tensor(0.0)
-                loss_fm_mrd = fake_wav.new_tensor(0.0)
+                disc_loss = wav.new_tensor(0.0)
+                speaker_cls_loss = wav.new_tensor(0.0)
 
                 if train_discriminator:
-                    _, gen_score_mp, fmap_rs_mp, fmap_gs_mp = mpd(real_wav, fake_wav)
-                    _, gen_score_mrd, fmap_rs_mrd, fmap_gs_mrd = mrd(real_wav, fake_wav)
-                    loss_gen_mp = average_generator_loss(gen_loss_fn, gen_score_mp)
-                    loss_gen_mrd = average_generator_loss(gen_loss_fn, gen_score_mrd)
-                    loss_fm_mp = average_feature_matching_loss(feat_matching_loss_fn, fmap_rs_mp, fmap_gs_mp)
-                    loss_fm_mrd = average_feature_matching_loss(feat_matching_loss_fn, fmap_rs_mrd, fmap_gs_mrd)
+                    with torch.no_grad():
+                        disc_outputs = model({"wav": wav, "ref_wav": ref_wav, "feat": feat})
+                        fake_wav = crop_to_match_last_dim(disc_outputs["recons"], disc_outputs["audios"])[0].squeeze(1)
+                        real_wav = crop_to_match_last_dim(disc_outputs["recons"], disc_outputs["audios"])[1].squeeze(1)
 
-                total_gen_loss = (
-                    recon_losses["total"]
-                    + float(cfg.loss.generator_mp_weight) * loss_gen_mp
-                    + float(cfg.loss.generator_mrd_weight) * loss_gen_mrd
-                    + float(cfg.loss.feature_matching_mp_weight) * loss_fm_mp
-                    + float(cfg.loss.feature_matching_mrd_weight) * loss_fm_mrd
-                )
-                loss = total_gen_loss / grad_accum_steps
+                    with autocast(device_type=device.type, enabled=use_amp):
+                        real_score_mp, fake_score_mp, _, _ = mpd(real_wav, fake_wav)
+                        real_score_mrd, fake_score_mrd, _, _ = mrd(real_wav, fake_wav)
+                        loss_disc_mp = average_discriminator_loss(disc_loss_fn, real_score_mp, fake_score_mp)
+                        loss_disc_mrd = average_discriminator_loss(disc_loss_fn, real_score_mrd, fake_score_mrd)
+                        disc_loss = (
+                            float(cfg.loss.discriminator_mp_weight) * loss_disc_mp
+                            + float(cfg.loss.discriminator_mrd_weight) * loss_disc_mrd
+                        )
+                        disc_loss_scaled = disc_loss / grad_accum_steps
 
-            scaler.scale(loss).backward()
+                    scaler_d.scale(disc_loss_scaled).backward()
 
-            if (global_step + 1) % grad_accum_steps == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.trainer.get("clip_grad_norm", 1.0)))
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
+                    if (global_step + 1) % grad_accum_steps == 0:
+                        scaler_d.unscale_(optimizer_d)
+                        torch.nn.utils.clip_grad_norm_(
+                            list(mpd.parameters()) + list(mrd.parameters()),
+                            float(cfg.trainer.get("clip_grad_norm", 1.0)),
+                        )
+                        scaler_d.step(optimizer_d)
+                        scaler_d.update()
+                        optimizer_d.zero_grad(set_to_none=True)
+                        scheduler_d.step()
 
-            global_step += 1
+                with autocast(device_type=device.type, enabled=use_amp):
+                    outputs = model({"wav": wav, "ref_wav": ref_wav, "feat": feat})
+                    recon_losses = compute_reconstruction_losses(outputs, feat, mel_loss_fn, stft_loss_fn, cfg)
+                    pred_wav, target_wav = crop_to_match_last_dim(outputs["recons"], outputs["audios"])
+                    fake_wav = pred_wav.squeeze(1)
+                    real_wav = target_wav.squeeze(1)
 
-            if global_step % log_every == 0:
-                current_lr = optimizer.param_groups[0]["lr"]
-                print(
-                    "[train] "
-                    f"epoch={epoch} step={global_step} "
-                    f"loss={float(total_gen_loss):.4f} "
-                    f"mel={float(recon_losses['mel']):.4f} "
-                    f"wav_l1={float(recon_losses['waveform_l1']):.4f} "
-                    f"feat_l1={float(recon_losses['feature_l1']):.4f} "
-                    f"stft={float(recon_losses['stft']):.4f} "
-                    f"vq={float(recon_losses['vq']):.4f} "
-                    f"gan_mp={float(loss_gen_mp):.4f} "
-                    f"gan_mrd={float(loss_gen_mrd):.4f} "
-                    f"fm_mp={float(loss_fm_mp):.4f} "
-                    f"fm_mrd={float(loss_fm_mrd):.4f} "
-                    f"disc={float(disc_loss) if train_discriminator else 0.0:.4f} "
-                    f"ppl={float(recon_losses['perplexity']):.2f} "
-                    f"active={float(recon_losses['active_num']):.2f} "
-                    f"lr={current_lr:.7f}"
-                )
+                    loss_gen_mp = fake_wav.new_tensor(0.0)
+                    loss_gen_mrd = fake_wav.new_tensor(0.0)
+                    loss_fm_mp = fake_wav.new_tensor(0.0)
+                    loss_fm_mrd = fake_wav.new_tensor(0.0)
 
-            if global_step % save_every == 0:
-                save_checkpoint(
-                    output_dir / "checkpoints" / f"step_{global_step:08d}.pt",
-                    model,
-                    optimizer,
-                    scheduler,
-                    scaler,
-                    epoch,
-                    global_step,
-                    best_val_loss,
-                    cfg,
-                    discriminator_state={
-                        "mpd": mpd.state_dict(),
-                        "mrd": mrd.state_dict(),
-                        "optimizer_d": optimizer_d.state_dict(),
-                        "scheduler_d": scheduler_d.state_dict(),
-                        "scaler_d": scaler_d.state_dict(),
-                    },
-                )
+                    if train_discriminator:
+                        _, gen_score_mp, fmap_rs_mp, fmap_gs_mp = mpd(real_wav, fake_wav)
+                        _, gen_score_mrd, fmap_rs_mrd, fmap_gs_mrd = mrd(real_wav, fake_wav)
+                        loss_gen_mp = average_generator_loss(gen_loss_fn, gen_score_mp)
+                        loss_gen_mrd = average_generator_loss(gen_loss_fn, gen_score_mrd)
+                        loss_fm_mp = average_feature_matching_loss(feat_matching_loss_fn, fmap_rs_mp, fmap_gs_mp)
+                        loss_fm_mrd = average_feature_matching_loss(feat_matching_loss_fn, fmap_rs_mrd, fmap_gs_mrd)
 
-            if valid_loader is not None and global_step % eval_every == 0:
-                metrics = evaluate(model, frontend, valid_loader, mel_loss_fn, stft_loss_fn, cfg, device)
-                print(
-                    "[valid] "
-                    f"step={global_step} "
-                    f"loss={metrics['total']:.4f} "
-                    f"mel={metrics['mel']:.4f} "
-                    f"wav_l1={metrics['waveform_l1']:.4f} "
-                    f"feat_l1={metrics['feature_l1']:.4f} "
-                    f"stft={metrics['stft']:.4f} "
-                    f"vq={metrics['vq']:.4f}"
-                )
-                val_loss = metrics["total"]
-                if best_val_loss is None or val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                    total_gen_loss = (
+                        recon_losses["total"]
+                        + float(cfg.loss.generator_mp_weight) * loss_gen_mp
+                        + float(cfg.loss.generator_mrd_weight) * loss_gen_mrd
+                        + float(cfg.loss.feature_matching_mp_weight) * loss_fm_mp
+                        + float(cfg.loss.feature_matching_mrd_weight) * loss_fm_mrd
+                    )
+                    if use_speaker_cls and "speaker_logits" in outputs and "speaker_label" in batch:
+                        logits = outputs["speaker_logits"]
+                        sl = batch["speaker_label"].to(device, non_blocking=True)
+                        speaker_cls_loss = F.cross_entropy(logits, sl)
+                        total_gen_loss = total_gen_loss + float(
+                            cfg.loss.get("speaker_classification_weight", 1.0)
+                        ) * speaker_cls_loss
+                    loss = total_gen_loss / grad_accum_steps
+
+                scaler.scale(loss).backward()
+
+                if (global_step + 1) % grad_accum_steps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.trainer.get("clip_grad_norm", 1.0)))
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
+
+                global_step += 1
+
+                if global_step % log_every == 0:
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    log_payload = {
+                        "loss": float(total_gen_loss.detach()),
+                        "mel": float(recon_losses["mel"]),
+                        "wav_l1": float(recon_losses["waveform_l1"]),
+                        "feat_l1": float(recon_losses["feature_l1"]),
+                        "stft": float(recon_losses["stft"]),
+                        "vq": float(recon_losses["vq"]),
+                        "gan_mp": float(loss_gen_mp.detach()),
+                        "gan_mrd": float(loss_gen_mrd.detach()),
+                        "fm_mp": float(loss_fm_mp.detach()),
+                        "fm_mrd": float(loss_fm_mrd.detach()),
+                        "disc": float(disc_loss.detach()) if train_discriminator else 0.0,
+                        "ppl": float(recon_losses["perplexity"]),
+                        "active": float(recon_losses["active_num"]),
+                        "spk_ce": float(speaker_cls_loss.detach()),
+                    }
+                    log_payload = ddp_average_metrics(log_payload, device)
+
+                    if is_main_process():
+                        print(
+                            "[train] "
+                            f"epoch={epoch} step={global_step} "
+                            f"loss={log_payload['loss']:.4f} "
+                            f"mel={log_payload['mel']:.4f} "
+                            f"wav_l1={log_payload['wav_l1']:.4f} "
+                            f"feat_l1={log_payload['feat_l1']:.4f} "
+                            f"stft={log_payload['stft']:.4f} "
+                            f"vq={log_payload['vq']:.4f} "
+                            f"gan_mp={log_payload['gan_mp']:.4f} "
+                            f"gan_mrd={log_payload['gan_mrd']:.4f} "
+                            f"fm_mp={log_payload['fm_mp']:.4f} "
+                            f"fm_mrd={log_payload['fm_mrd']:.4f} "
+                            f"disc={log_payload['disc']:.4f} "
+                            f"ppl={log_payload['ppl']:.2f} "
+                            f"active={log_payload['active']:.2f} "
+                            f"spk_ce={log_payload['spk_ce']:.4f} "
+                            f"lr={current_lr:.7f}"
+                        )
+
+                if global_step % save_every == 0:
                     save_checkpoint(
-                        output_dir / "checkpoints" / "best.pt",
+                        output_dir / "checkpoints" / f"step_{global_step:08d}.pt",
                         model,
                         optimizer,
                         scheduler,
@@ -753,70 +1058,122 @@ def train_bicodec(cfg: DictConfig) -> None:
                         best_val_loss,
                         cfg,
                         discriminator_state={
-                            "mpd": mpd.state_dict(),
-                            "mrd": mrd.state_dict(),
+                            "mpd": unwrap_model(mpd).state_dict(),
+                            "mrd": unwrap_model(mrd).state_dict(),
                             "optimizer_d": optimizer_d.state_dict(),
                             "scheduler_d": scheduler_d.state_dict(),
                             "scaler_d": scaler_d.state_dict(),
                         },
                     )
 
-            if global_step >= max_steps:
-                save_checkpoint(
-                    output_dir / "checkpoints" / "last.pt",
-                    model,
-                    optimizer,
-                    scheduler,
-                    scaler,
-                    epoch,
-                    global_step,
-                    best_val_loss,
-                    cfg,
-                    discriminator_state={
-                        "mpd": mpd.state_dict(),
-                        "mrd": mrd.state_dict(),
-                        "optimizer_d": optimizer_d.state_dict(),
-                        "scheduler_d": scheduler_d.state_dict(),
-                        "scaler_d": scaler_d.state_dict(),
-                    },
-                )
-                print(f"[done] reached max_steps={max_steps}")
-                return
+                if valid_loader is not None and global_step % eval_every == 0:
+                    if is_dist_initialized():
+                        dist.barrier()
+
+                    metrics = evaluate(
+                        model,
+                        frontend,
+                        valid_loader,
+                        mel_loss_fn,
+                        stft_loss_fn,
+                        cfg,
+                        device,
+                    )
+
+                    if is_main_process():
+                        print(
+                            "[valid] "
+                            f"step={global_step} "
+                            f"loss={metrics['total']:.4f} "
+                            f"mel={metrics['mel']:.4f} "
+                            f"wav_l1={metrics['waveform_l1']:.4f} "
+                            f"feat_l1={metrics['feature_l1']:.4f} "
+                            f"stft={metrics['stft']:.4f} "
+                            f"vq={metrics['vq']:.4f}"
+                        )
+
+                    val_loss = metrics["total"]
+                    if best_val_loss is None or val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        save_checkpoint(
+                            output_dir / "checkpoints" / "best.pt",
+                            model,
+                            optimizer,
+                            scheduler,
+                            scaler,
+                            epoch,
+                            global_step,
+                            best_val_loss,
+                            cfg,
+                            discriminator_state={
+                                "mpd": unwrap_model(mpd).state_dict(),
+                                "mrd": unwrap_model(mrd).state_dict(),
+                                "optimizer_d": optimizer_d.state_dict(),
+                                "scheduler_d": scheduler_d.state_dict(),
+                                "scaler_d": scaler_d.state_dict(),
+                            },
+                        )
+
+                if global_step >= max_steps:
+                    save_checkpoint(
+                        output_dir / "checkpoints" / "last.pt",
+                        model,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        epoch,
+                        global_step,
+                        best_val_loss,
+                        cfg,
+                        discriminator_state={
+                            "mpd": unwrap_model(mpd).state_dict(),
+                            "mrd": unwrap_model(mrd).state_dict(),
+                            "optimizer_d": optimizer_d.state_dict(),
+                            "scheduler_d": scheduler_d.state_dict(),
+                            "scaler_d": scaler_d.state_dict(),
+                        },
+                    )
+                    if is_main_process():
+                        print(f"[done] reached max_steps={max_steps}")
+                    return
+
+            save_checkpoint(
+                output_dir / "checkpoints" / f"epoch_{epoch + 1:04d}.pt",
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch + 1,
+                global_step,
+                best_val_loss,
+                cfg,
+                discriminator_state={
+                    "mpd": unwrap_model(mpd).state_dict(),
+                    "mrd": unwrap_model(mrd).state_dict(),
+                    "optimizer_d": optimizer_d.state_dict(),
+                    "scheduler_d": scheduler_d.state_dict(),
+                    "scaler_d": scaler_d.state_dict(),
+                },
+            )
 
         save_checkpoint(
-            output_dir / "checkpoints" / f"epoch_{epoch + 1:04d}.pt",
+            output_dir / "checkpoints" / "last.pt",
             model,
             optimizer,
             scheduler,
             scaler,
-            epoch + 1,
+            max_epochs,
             global_step,
             best_val_loss,
             cfg,
             discriminator_state={
-                "mpd": mpd.state_dict(),
-                "mrd": mrd.state_dict(),
+                "mpd": unwrap_model(mpd).state_dict(),
+                "mrd": unwrap_model(mrd).state_dict(),
                 "optimizer_d": optimizer_d.state_dict(),
                 "scheduler_d": scheduler_d.state_dict(),
                 "scaler_d": scaler_d.state_dict(),
             },
         )
 
-    save_checkpoint(
-        output_dir / "checkpoints" / "last.pt",
-        model,
-        optimizer,
-        scheduler,
-        scaler,
-        max_epochs,
-        global_step,
-        best_val_loss,
-        cfg,
-        discriminator_state={
-            "mpd": mpd.state_dict(),
-            "mrd": mrd.state_dict(),
-            "optimizer_d": optimizer_d.state_dict(),
-            "scheduler_d": scheduler_d.state_dict(),
-            "scaler_d": scaler_d.state_dict(),
-        },
-    )
+    finally:
+        cleanup_ddp()

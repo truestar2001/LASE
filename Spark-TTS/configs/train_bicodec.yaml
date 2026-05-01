@@ -1,3 +1,5 @@
+# exp 대안: train_bicodec_exp1/2.yaml — trainer.freeze, speaker_classification, detach_xvector_condition
+
 seed: 42
 
 model:
@@ -18,6 +20,7 @@ model:
 data:
   train_manifest: /home/jyp/LASE/Spark-TTS/manifests/voxceleb2.json
   valid_manifest: null
+  speaker_id_key: speaker_id
   audio_key: audio_filepath
   base_dir: null
   volume_normalize: false
@@ -43,6 +46,7 @@ loss:
   feature_matching_mrd_weight: 1.0
   discriminator_mp_weight: 1.0
   discriminator_mrd_weight: 1.0
+  speaker_classification_weight: 1.0
   mel_n_fft: 1024
   mel_hop_length: 256
   mel_n_mels: 80
@@ -70,6 +74,11 @@ disc_optim:
   weight_decay: 0.0
 
 trainer:
+  speaker_classification: false
+  # freeze:  # true = 동결(가중치 + 학습 루프에선 eval)
+  #   encoder: true
+  # detach_xvector_condition: false
+  freeze_semantic_encoder: false
   output_dir: exp/bicodec
   device: null
   batch_size: 4

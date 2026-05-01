@@ -2,6 +2,9 @@
 
 base_config: base/train_bicodec.yaml
 
+loss:
+  vq_weight: 0.0
+
 model:
   speaker_input_key: wav
   speaker_time_adapter:

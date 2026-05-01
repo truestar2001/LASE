@@ -78,7 +78,32 @@ class SpeakerEncoder(nn.Module):
         zq, indices = self.quantizer(x)
         return indices
 
-    def forward(self, mels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def extract_xvector_and_ecapa_latent(
+        self, mels: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.speaker_encoder(mels, True)
+
+    def _quantize_from_ecapa_latent(
+        self, ecapa_latent: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.perceiver_sampler(ecapa_latent.transpose(1, 2)).transpose(1, 2)
+        return self.quantizer(x)
+
+    def _project_d_vector(self, zq: torch.Tensor) -> torch.Tensor:
+        x = zq.reshape(zq.shape[0], -1)
+        return self.project(x)
+
+    def encode_from_ecapa_latent(
+        self, ecapa_latent: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_vector = self.speaker_encoder.project_latent(ecapa_latent)
+        zq, _ = self._quantize_from_ecapa_latent(ecapa_latent)
+        d_vector = self._project_d_vector(zq)
+        return x_vector, d_vector
+
+    def forward(
+        self, mels: torch.Tensor, return_ecapa_latent: bool = False
+    ) -> Tuple[torch.Tensor, ...]:
         """
         Args:
             mels: (B, D_mel, T1)
@@ -87,29 +112,28 @@ class SpeakerEncoder(nn.Module):
             x_vector: (B, out_dim)
             d_vector: (B, out_dim)
         """
-        # mels = mels.transpose(1,2)
+        x_vector, ecapa_latent = self.extract_xvector_and_ecapa_latent(mels)
+        zq, _ = self._quantize_from_ecapa_latent(ecapa_latent)
+        d_vector = self._project_d_vector(zq)
 
-        x_vector, features = self.speaker_encoder(mels, True)
-        x = self.perceiver_sampler(features.transpose(1, 2)).transpose(1, 2)
-        zq, indices = self.quantizer(x)  # zq: (B, latent_dim, T2, latent_dim)
-        x = zq.reshape(zq.shape[0], -1)
-        d_vector = self.project(x)
-
+        if return_ecapa_latent:
+            return x_vector, d_vector, ecapa_latent
         return x_vector, d_vector
-    
+
+    def tokenize_from_ecapa_latent(self, ecapa_latent: torch.Tensor) -> torch.Tensor:
+        """tokenize precomputed ECAPA latent"""
+        _, indices = self._quantize_from_ecapa_latent(ecapa_latent)
+        return indices
+
     def tokenize(self, mels: torch.Tensor) -> torch.Tensor:
         """tokenize the input mel spectrogram"""
-        _, features = self.speaker_encoder(mels, True)
-        x = self.perceiver_sampler(features.transpose(1, 2)).transpose(1, 2)
-        zq, indices = self.quantizer(x)
-        return indices
-    
+        _, ecapa_latent = self.extract_xvector_and_ecapa_latent(mels)
+        return self.tokenize_from_ecapa_latent(ecapa_latent)
+
     def detokenize(self, indices: torch.Tensor) -> torch.Tensor:
         """detokenize the input indices to d-vector"""
         zq = self.quantizer.get_output_from_indices(indices.transpose(1, 2)).transpose(1, 2)
-        x = zq.reshape(zq.shape[0], -1)
-        d_vector = self.project(x)
-        return d_vector
+        return self._project_d_vector(zq)
 
 if __name__ == "__main__":
     model = SpeakerEncoder(

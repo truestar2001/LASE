@@ -7,7 +7,7 @@ model:
   feature_extractor_path: null
   strict_load: false
 data:
-  train_manifest: /home/jyp/LASE/Spark-TTS/manifests/voxceleb2.json
+  train_manifest: /home/jyp/LASE/Spark-TTS/manifests/voxceleb2.jsonl
   valid_manifest: null
   audio_key: audio_filepath
   base_dir: null

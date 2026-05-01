@@ -15,9 +15,10 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
-from typing import Dict, Any
-from omegaconf import DictConfig
+from typing import Any, Dict, Optional, Tuple
+from omegaconf import DictConfig, OmegaConf
 from safetensors.torch import load_file
 
 from sparktts.utils.file import load_config
@@ -26,6 +27,54 @@ from sparktts.modules.encoder_decoder.feat_encoder import Encoder
 from sparktts.modules.encoder_decoder.feat_decoder import Decoder
 from sparktts.modules.encoder_decoder.wave_generator import WaveGenerator
 from sparktts.modules.vq.factorized_vector_quantize import FactorizedVectorQuantize
+
+
+class SpeakerTimeAdapter(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: Optional[int] = None,
+        num_layers: int = 2,
+        kernel_size: int = 3,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("SpeakerTimeAdapter requires num_layers >= 1")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("SpeakerTimeAdapter requires an odd kernel_size >= 1")
+
+        hidden_dim = int(hidden_dim or input_dim)
+        padding = kernel_size // 2
+
+        blocks = []
+        in_dim = input_dim
+        for _ in range(num_layers):
+            block = [
+                nn.Conv1d(in_dim, hidden_dim, kernel_size=kernel_size, padding=padding),
+                nn.GroupNorm(1, hidden_dim),
+                nn.GELU(),
+            ]
+            if dropout > 0:
+                block.append(nn.Dropout(dropout))
+            blocks.append(nn.Sequential(*block))
+            in_dim = hidden_dim
+
+        self.blocks = nn.Sequential(*blocks)
+        self.out_proj = nn.Conv1d(hidden_dim, input_dim, kernel_size=1)
+        self.res_scale = nn.Parameter(torch.full((1,), 1e-3))
+
+    def forward(self, ecapa_latent: torch.Tensor, target_length: int) -> torch.Tensor:
+        if ecapa_latent.shape[-1] != target_length:
+            ecapa_latent = F.interpolate(
+                ecapa_latent,
+                size=target_length,
+                mode="linear",
+                align_corners=False,
+            )
+        adapted = self.blocks(ecapa_latent)
+        adapted = self.out_proj(adapted)
+        return ecapa_latent + self.res_scale * adapted
 
 
 class BiCodec(nn.Module):
@@ -43,6 +92,9 @@ class BiCodec(nn.Module):
         speaker_encoder: nn.Module,
         prenet: nn.Module,
         postnet: nn.Module,
+        speaker_time_condition: Optional[nn.Module] = None,
+        speaker_input_key: str = "ref_wav",
+        detach_speaker_time_input: bool = False,
         use_codebook: bool = True,
         **kwargs
     ) -> None:
@@ -65,6 +117,9 @@ class BiCodec(nn.Module):
         self.speaker_encoder = speaker_encoder
         self.prenet = prenet
         self.postnet = postnet
+        self.speaker_time_condition = speaker_time_condition
+        self.speaker_input_key = str(speaker_input_key)
+        self.detach_speaker_time_input = bool(detach_speaker_time_input)
         self.use_codebook = use_codebook
         self.init_mel_transformer(mel_params)
 
@@ -86,6 +141,37 @@ class BiCodec(nn.Module):
         postnet = Decoder(**config["postnet"])
         decoder = WaveGenerator(**config["decoder"])
         speaker_encoder = SpeakerEncoder(**config["speaker_encoder"])
+        speaker_input_key = str(config.get("speaker_input_key", "ref_wav"))
+
+        speaker_time_condition_cfg = config.get("speaker_time_adapter")
+        if speaker_time_condition_cfg is None:
+            speaker_time_condition_cfg = config.get("speaker_time_condition")
+        if isinstance(speaker_time_condition_cfg, DictConfig):
+            speaker_time_condition_cfg = OmegaConf.to_container(
+                speaker_time_condition_cfg, resolve=True
+            )
+        detach_speaker_time_input = False
+        speaker_time_condition = None
+        if isinstance(speaker_time_condition_cfg, dict) and bool(
+            speaker_time_condition_cfg.get("enabled", False)
+        ):
+            detach_speaker_time_input = bool(
+                speaker_time_condition_cfg.get("detach_input", False)
+            )
+            speaker_time_input_dim = int(
+                getattr(
+                    getattr(speaker_encoder.speaker_encoder, "conv", None),
+                    "out_channels",
+                    512 * 3,
+                )
+            )
+            speaker_time_condition = SpeakerTimeAdapter(
+                input_dim=speaker_time_input_dim,
+                hidden_dim=speaker_time_condition_cfg.get("hidden_dim"),
+                num_layers=int(speaker_time_condition_cfg.get("num_layers", 2)),
+                kernel_size=int(speaker_time_condition_cfg.get("kernel_size", 3)),
+                dropout=float(speaker_time_condition_cfg.get("dropout", 0.0)),
+            )
 
         return cls(
             mel_params=mel_params,
@@ -95,6 +181,9 @@ class BiCodec(nn.Module):
             speaker_encoder=speaker_encoder,
             prenet=prenet,
             postnet=postnet,
+            speaker_time_condition=speaker_time_condition,
+            speaker_input_key=speaker_input_key,
+            detach_speaker_time_input=detach_speaker_time_input,
             use_codebook=config.get("use_codebook", True),
         )
 
@@ -126,6 +215,56 @@ class BiCodec(nn.Module):
 
         return model
 
+    def _select_speaker_wav(self, batch: Dict[str, Any]) -> torch.Tensor:
+        for key in (self.speaker_input_key, "ref_wav", "wav"):
+            value = batch.get(key)
+            if value is not None:
+                return value
+        raise KeyError(
+            f"BiCodec requires one of {self.speaker_input_key!r}, 'ref_wav', or 'wav' in batch"
+        )
+
+    def _target_length(self, semantic_tokens: torch.Tensor) -> int:
+        if semantic_tokens.dim() == 2:
+            return int(semantic_tokens.shape[-1])
+        return int(semantic_tokens.shape[1])
+
+    def _encode_speaker(
+        self, speaker_wav: torch.Tensor, target_length: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mel = self.mel_transformer(speaker_wav).squeeze(1)
+        if self.speaker_time_condition is None or target_length is None:
+            return self.speaker_encoder(mel.transpose(1, 2))
+
+        _, ecapa_latent = self.speaker_encoder.extract_xvector_and_ecapa_latent(
+            mel.transpose(1, 2)
+        )
+        speaker_time_input = (
+            ecapa_latent.detach() if self.detach_speaker_time_input else ecapa_latent
+        )
+        ecapa_latent = self.speaker_time_condition(
+            speaker_time_input, target_length=target_length
+        )
+        return self.speaker_encoder.encode_from_ecapa_latent(ecapa_latent)
+
+    def _tokenize_speaker(
+        self, speaker_wav: torch.Tensor, target_length: Optional[int] = None
+    ) -> torch.Tensor:
+        mel = self.mel_transformer(speaker_wav).squeeze(1)
+        if self.speaker_time_condition is None or target_length is None:
+            return self.speaker_encoder.tokenize(mel.transpose(1, 2))
+
+        _, ecapa_latent = self.speaker_encoder.extract_xvector_and_ecapa_latent(
+            mel.transpose(1, 2)
+        )
+        speaker_time_input = (
+            ecapa_latent.detach() if self.detach_speaker_time_input else ecapa_latent
+        )
+        ecapa_latent = self.speaker_time_condition(
+            speaker_time_input, target_length=target_length
+        )
+        return self.speaker_encoder.tokenize_from_ecapa_latent(ecapa_latent)
+
     def forward(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """
         Performs a forward pass through the model.
@@ -137,9 +276,8 @@ class BiCodec(nn.Module):
             dict: A dictionary containing the reconstruction, features, and other metrics.
         """
         feat = batch["feat"]
-        mel = self.mel_transformer(batch["ref_wav"]).squeeze(1)
-
         z = self.encoder(feat.transpose(1, 2))
+
         if self.use_codebook:
             vq_outputs = self.quantizer(z)
             z_q = vq_outputs["z_q"]
@@ -152,10 +290,13 @@ class BiCodec(nn.Module):
             perplexity = z.new_tensor(0.0)
             active_num = z.new_tensor(0.0)
 
-        x_vector, d_vector = self.speaker_encoder(mel.transpose(1, 2))
+        speaker_wav = self._select_speaker_wav(batch)
+        x_vector, d_vector = self._encode_speaker(
+            speaker_wav, target_length=z_q.shape[-1]
+        )
 
-        # conditions = d_vector
-        conditions = x_vector # original
+        use_detached = getattr(self, "_bicodec_detach_xvector", False)
+        conditions = x_vector.detach() if use_detached else x_vector
         
         with_speaker_loss = False
         x = self.prenet(z_q, conditions)
@@ -163,7 +304,7 @@ class BiCodec(nn.Module):
         x = x + conditions.unsqueeze(-1)
         wav_recon = self.decoder(x)
 
-        return {
+        out: Dict[str, Any] = {
             "vq_loss": vq_loss,
             "perplexity": perplexity,
             "cluster_size": active_num,
@@ -174,6 +315,10 @@ class BiCodec(nn.Module):
             "audios": batch["wav"].unsqueeze(1),
             "with_speaker_loss": with_speaker_loss,
         }
+        clf = getattr(self, "speaker_classifier", None)
+        if clf is not None:
+            out["speaker_logits"] = clf(x_vector.detach())
+        return out
 
     @torch.no_grad()
     def tokenize(self, batch: Dict[str, Any]):
@@ -187,14 +332,15 @@ class BiCodec(nn.Module):
             tuple: Semantic tokens and global tokens.
         """
         feat = batch["feat"]
-        mel = self.mel_transformer(batch["ref_wav"]).squeeze(1)
-
+        speaker_wav = self._select_speaker_wav(batch)
         z = self.encoder(feat.transpose(1, 2))
         if self.use_codebook:
             semantic_tokens = self.quantizer.tokenize(z)
         else:
             semantic_tokens = z.transpose(1, 2)
-        global_tokens = self.speaker_encoder.tokenize(mel.transpose(1, 2))
+        global_tokens = self._tokenize_speaker(
+            speaker_wav, target_length=self._target_length(semantic_tokens)
+        )
 
         return semantic_tokens, global_tokens
 

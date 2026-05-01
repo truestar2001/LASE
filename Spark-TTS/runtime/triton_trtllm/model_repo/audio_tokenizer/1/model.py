@@ -111,11 +111,16 @@ class TritonPythonModel:
             reference_wav_ref_clip_list.append(torch.from_numpy(wav_ref_clip))
 
         # Batch process through tokenizer
+        wav_tensor = torch.nn.utils.rnn.pad_sequence(
+            [torch.from_numpy(wav).float() for wav in reference_wav_list],
+            batch_first=True,
+        )
         ref_wav_clip_tensor = torch.stack(reference_wav_ref_clip_list, dim=0)
         wav2vec2_features = self.audio_tokenizer.extract_wav2vec2_features(
             reference_wav_list)
         
         audio_tokenizer_input = {
+            "wav": wav_tensor.to(self.device),
             "ref_wav": ref_wav_clip_tensor.to(self.device),
             "feat": wav2vec2_features.to(self.device),
         }

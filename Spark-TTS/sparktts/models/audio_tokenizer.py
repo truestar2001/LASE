@@ -122,7 +122,20 @@ class BiCodecTokenizer:
                 - codebook off: continuous semantic latents
             global_tokens: global tokens
         """
-        feats = self.extract_wav2vec2_features(batch["wav"])
+        wavs = batch["wav"]
+        feats = self.extract_wav2vec2_features(wavs)
+        if isinstance(wavs, (list, tuple)):
+            wav_tensors = []
+            for wav in wavs:
+                if torch.is_tensor(wav):
+                    wav_tensors.append(wav.float())
+                else:
+                    wav_tensors.append(torch.from_numpy(np.asarray(wav)).float())
+            batch["wav"] = torch.nn.utils.rnn.pad_sequence(
+                wav_tensors, batch_first=True
+            ).to(self.device)
+        elif torch.is_tensor(wavs):
+            batch["wav"] = wavs.to(self.device)
         batch["feat"] = feats
         semantic_tokens, global_tokens = self.model.tokenize(batch)
 

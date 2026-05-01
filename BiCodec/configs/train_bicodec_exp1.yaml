@@ -2,6 +2,9 @@
 
 base_config: base/train_bicodec.yaml
 
+loss:
+  vq_weight: 0.0
+
 trainer:
   output_dir: outputs/bicodec_exp1
   detach_xvector_condition: true

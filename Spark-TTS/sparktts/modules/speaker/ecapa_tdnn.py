@@ -188,6 +188,13 @@ class ECAPA_TDNN(nn.Module):
         else:
             self.bn2 = nn.Identity()
 
+    def project_latent(self, latent):
+        out = self.bn(self.pool(latent))
+        out = self.linear(out)
+        if self.emb_bn:
+            out = self.bn2(out)
+        return out
+
     def forward(self, x, return_latent=False):
         x = x.permute(0, 2, 1)  # (B,T,F) -> (B,F,T)
 
@@ -198,10 +205,7 @@ class ECAPA_TDNN(nn.Module):
 
         out = torch.cat([out2, out3, out4], dim=1)
         latent = F.relu(self.conv(out))
-        out = self.bn(self.pool(latent))
-        out = self.linear(out)
-        if self.emb_bn:
-            out = self.bn2(out)
+        out = self.project_latent(latent)
 
         if return_latent:
             return out, latent
